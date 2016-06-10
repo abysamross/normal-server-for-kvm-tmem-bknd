@@ -170,7 +170,7 @@ resend:
                                                                           
         wait_event_timeout(bflt_wait,\
                         !skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue),\
-                                                                        1*HZ);   
+                                                                        10*HZ);   
         if(!skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue))                 
         {                                                                        
                 pr_info("client receiving message\n");                           
