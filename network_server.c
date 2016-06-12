@@ -33,6 +33,8 @@ static int tcp_listener_started = 0;
 static int tcp_acceptor_stopped = 0;
 static int tcp_acceptor_started = 0;
 //struct socket *client_conn_socket = NULL;
+int bit_size = 268435456;
+struct bloom_filter *bflt = NULL;
 
 DEFINE_SPINLOCK(tcp_server_lock);
 
@@ -536,6 +538,9 @@ int tcp_server_start(void)
 
 static int __init network_server_init(void)
 {
+        struct bloom_filter *bflt = NULL;
+        unsigned long bitmap_bytes_size; 
+
         pr_info(" *** mtp | initiating network_server | "
                 "network_server_init ***\n");
         tcp_server = kmalloc(sizeof(struct tcp_server_service), GFP_KERNEL);
@@ -543,6 +548,29 @@ static int __init network_server_init(void)
 
         tcp_conn_handler = kmalloc(sizeof(struct tcp_conn_handler), GFP_KERNEL);
         memset(tcp_conn_handler, 0, sizeof(struct tcp_conn_handler));
+
+        bitmap_bytes_size = 
+                BITS_TO_LONGS(bit_size)*sizeof(unsigned long);
+        
+        bflt = vmalloc(sizeof(*bflt)+bitmap_bytes_size);
+
+        if(!bflt)
+        {
+                pr_info(" *** mtp | failed to allocate memory for bflt | "
+                        "network_server_init *** \n");
+        }
+        else
+        {
+                bflt->bitmap_bits_size = bit_size;
+
+                /* randomly set two bits in the bitmap */
+                set_bit(0, bflt->bitmap);
+                set_bit(10, bflt->bitmap);
+                set_bit(1024, bflt->bitmap);
+                set_bit(4095, bflt->bitmap);
+                set_bit(1024, bflt->bitmap);
+                set_bit(20160, bflt->bitmap);
+        }
 
         if(tcp_server_start() != 0)
         {
@@ -566,9 +594,9 @@ static int __init network_server_init(void)
                 {
                         ret = kthread_stop(tcp_server->accept_thread);
                         if(!ret)
-                                pr_info(" *** mtp | stopping tcp server acceot thread "
-                                        "as local client could not setup a "
-                                        "connection with leader server | "
+                                pr_info(" *** mtp | stopping tcp server accept "
+                                        "thread as local client could not setup "
+                                        "a connection with leader server | "
                                         "network_server_init *** \n");
                 }
 
@@ -576,10 +604,10 @@ static int __init network_server_init(void)
                 {
                         ret = kthread_stop(tcp_server->thread);
                         if(!ret)
-                                pr_info(" *** mtp | stopping tcp server listening thread "
-                                        "as local client could not setup a "
-                                        "connection with leader server | "
-                                        "network_server_init *** \n");
+                                pr_info(" *** mtp | stopping tcp server listening"
+                                        " thread as local client could not setup"
+                                        " a connection with leader server |"
+                                        " network_server_init *** \n");
 
                         if(tcp_server->listen_socket != NULL)
                         {
@@ -595,7 +623,11 @@ static int __init network_server_init(void)
                 return -1;
         }
 
-        tcp_client_fwd_filter();
+        if(bflt)
+                tcp_client_fwd_filter(bflt);
+        else
+                pr_info("network server unable to call tcp_client_fwd_filter"
+                        "(bflt) as bflt not created \n");
 
         return 0;
 }
