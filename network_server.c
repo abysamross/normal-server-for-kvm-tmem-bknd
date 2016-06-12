@@ -122,13 +122,14 @@ repeat_send:
         return written?written:len;
 }
 
-int tcp_server_receive(struct socket *sock, int id,struct sockaddr_in *address,\
-                unsigned char *buf,int size, unsigned long flags)
+//int tcp_server_receive(struct socket *sock, int id,struct sockaddr_in *address,
+//                unsigned char *buf,int size, unsigned long flags)
+int tcp_server_receive(struct socket *sock, unsigned char *buf,int size, unsigned long flags)
 {
         struct msghdr msg;
         struct kvec vec;
         int len;
-        char *tmp = NULL;
+        //char *tmp = NULL;
         
         if(sock==NULL)
         {
@@ -157,11 +158,11 @@ read_again:
         if(len == -EAGAIN || len == -ERESTARTSYS)
                 goto read_again;
         
-        tmp = inet_ntoa(&(address->sin_addr));
+        //tmp = inet_ntoa(&(address->sin_addr));
 
-        pr_info("client-> %s:%d, says: %s\n", tmp, ntohs(address->sin_port), buf);
+        //pr_info("client-> %s:%d, says: %s\n", tmp, ntohs(address->sin_port), buf);
 
-        kfree(tmp);
+        //kfree(tmp);
         //len = msg.msg_iter.kvec->iov_len;
         return len;
 }
@@ -179,10 +180,14 @@ int connection_handler(void *data)
        int len = 49;
        unsigned char in_buf[len+1];
        unsigned char out_buf[len+1];
+       char *tmp =NULL;
+       int port;
 
        DECLARE_WAITQUEUE(recv_wait, current);
 
        allow_signal(SIGKILL|SIGSTOP);
+       tmp = inet_ntoa(&(address->sin_addr));
+       port = ntohs(address->sin_port);
 
        while(1)
        {
@@ -205,6 +210,7 @@ int connection_handler(void *data)
                                               &recv_wait);
                               kfree(tcp_conn_handler->data[id]->address);
                               kfree(tcp_conn_handler->data[id]);
+                              kfree(tmp);
                         sock_release(tcp_conn_handler->data[id]->accept_socket);
                               return 0;
                       }
@@ -222,8 +228,13 @@ int connection_handler(void *data)
 
               pr_info("receiving message\n");
               memset(in_buf, 0, len+1);
-              ret = tcp_server_receive(accept_socket, id, address, in_buf, len,\
-                                       MSG_DONTWAIT);
+              //ret = tcp_server_receive(accept_socket, id, address, in_buf, len,
+              //                         MSG_DONTWAIT);
+              ret = tcp_server_receive(accept_socket, in_buf, len, MSG_DONTWAIT);
+
+              pr_info("received: %d bytes from leader-> %s:%d, says: %s\n", 
+                              ret, tmp, port, in_buf);
+
               if(ret > 0)
               {
                       if(memcmp(in_buf, "RECV", 4) == 0)
@@ -277,6 +288,7 @@ out:
        tcp_conn_handler->tcp_conn_handler_stopped[id]= 1;
        kfree(tcp_conn_handler->data[id]->address);
        kfree(tcp_conn_handler->data[id]);
+       kfree(tmp);
        sock_release(tcp_conn_handler->data[id]->accept_socket);
        tcp_conn_handler->thread[id] = NULL;
        do_exit(0);
