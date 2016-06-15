@@ -53,13 +53,16 @@ u32 create_addr_from_str(char *str)
         return addr;
 }
 
-int tcp_client_send(struct socket *sock, const char *buf, const size_t length,\
-                unsigned long flags)
+int tcp_client_send(struct socket *sock, void *snd_buf, const size_t length,\
+                unsigned long flags, int huge)
 {
         struct msghdr msg;
         //struct iovec iov;
         struct kvec vec;
         int len, written = 0, left = length;
+        char *buf;
+        unsigned long *bitmap;
+
         mm_segment_t oldmm;
 
         msg.msg_name    = 0;
@@ -72,14 +75,25 @@ int tcp_client_send(struct socket *sock, const char *buf, const size_t length,\
         msg.msg_controllen = 0;
         msg.msg_flags   = flags;
 
+        if(huge)
+                bitmap = (unsigned long *)snd_buf;
+        else
+                buf = (char *)snd_buf;
+
         oldmm = get_fs(); set_fs(KERNEL_DS);
+
 repeat_send:
         /*
         msg.msg_iov->iov_len  = left;
         msg.msg_iov->iov_base = (char *)buf + written; 
         */
         vec.iov_len = left;
-        vec.iov_base = (char *)buf + written;
+
+        if(huge)
+                vec.iov_base = bitmap + written;
+        else
+                vec.iov_base = buf + written;
+
 
         //len = sock_sendmsg(sock, &msg, left);
         //len = kernel_sendmsg(sock, &msg, &vec, 1???, left);????
@@ -87,6 +101,7 @@ repeat_send:
         if((len == -ERESTARTSYS) || (!(flags & MSG_DONTWAIT) &&\
                                 (len == -EAGAIN)))
                 goto repeat_send;
+
         if(len > 0)
         {
                 written += len;
@@ -163,33 +178,41 @@ int tcp_client_fwd_filter(struct bloom_filter *bflt)
         char in_msg[len+1];                                              
         char out_msg[len+1];                                            
         int ret;
-        const void *pg_vaddr;
+        void *vaddr;
         //unsigned long off;
         int size;
-        struct page *pg;
-        int pc = 0;
+        //struct page *pg;
+        //int pc = 0;
 
         DECLARE_WAIT_QUEUE_HEAD(bflt_wait);                               
 resend:                                                                  
-        pr_info("client sending FRWD:BFLT\n");                           
+        pr_info(" *** mtp | client sending FRWD:BFLT | "
+                "tcp_client_fwd_filter ***\n");                           
 
         //size = (bflt->bitmap_bits_size) >> 3;
-        size = BITS_TO_LONGS(bflt->bitmap_bits_size)*sizeof(unsigned long);
+        size = BITS_TO_LONGS(bflt->bitmap_size)*sizeof(unsigned long);
 
         memset(out_msg, 0, len+1);                                        
         //strcat(out_msg, "FRWD:BFLT");                                     
         snprintf(out_msg, sizeof(out_msg), "FRWD:BFLT:%d",\
-                        bflt->bitmap_bits_size);
-        tcp_client_send(cli_conn_socket, out_msg, strlen(out_msg), MSG_DONTWAIT);
-                                                                          
-        wait_event_timeout(bflt_wait,\
+                        bflt->bitmap_size);
+        tcp_client_send(cli_conn_socket, out_msg, strlen(out_msg),\
+                        MSG_DONTWAIT, 0);
+wait:
+        while(!(wait_event_timeout(bflt_wait,\
                         !skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue),\
-                                                                        10*HZ);   
+                                                                        HZ)));   
         if(!skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue))              
         {                                                                        
-                pr_info("client receiving message\n");                           
+                pr_info(" *** mtp | client receiving message | "
+                        "tcp_client_fwd_filter ***\n");                           
                 memset(in_msg, 0, len+1);                                 
+
                 ret = tcp_client_receive(cli_conn_socket, in_msg, MSG_DONTWAIT); 
+
+                pr_info(" *** mtp | client received: %d bytes | "
+                        "tcp_client_fwd_filter ***\n", ret);                           
+
                 if(ret > 0)                                              
                 {
                         if(memcmp(in_msg, "SEND", 4) == 0)
@@ -205,23 +228,34 @@ resend:
                                          */
                                       if(((unsigned long)bflt & (PAGE_SIZE-1))
                                                       != 0)
-                                                pr_info("bflt does not start "
-                                                        "from a page boundary\n");
+                                                pr_info(" *** mtp | bflt does "
+                                                        "not start from a page "
+                                                        "boundary | "
+                                                        "tcp_client_fwd_filter"
+                                                        " ***\n");
 
-                                        pg_vaddr = 
-                                        (void*)((unsigned long)bflt & PAGE_MASK);
+                                        vaddr = 
+                        (void*)((unsigned long)bflt->bitmap);
+
+                        ret = tcp_client_send(cli_conn_socket, vaddr,\
+                                size, MSG_DONTWAIT, 1);
+
+                        pr_info(" *** mtp | client send: %d bytes | "
+                                "as bflt tcp_client_fwd_filter ***\n", ret);                           
+                                      goto wait;
                                         
-                                        for(;pg_vaddr <= (void *)(bflt + size);
-                                                        pg_vaddr += PAGE_SIZE)
+                                        /*
+                                        for(;vaddr <= (void *)(bflt + size);
+                                                        vaddr += PAGE_SIZE)
                                         {
-                                                pg = vmalloc_to_page(pg_vaddr);
-                                                /*call kernel_sendpage*/
+                                                pg = vmalloc_to_page(vaddr);
                                                 kernel_sendpage(cli_conn_socket,\
                                                                pg, 0, PAGE_SIZE,\
                                                                MSG_DONTWAIT);
                                                 pr_info("page: %d sent\n", pc);
                                                 pc++;
                                         }
+                                        */
                                 }
                                 /*
                                 else if(memcmp(in_msg+4, "PAGE", 4) == 0)
@@ -233,11 +267,13 @@ resend:
                                 }
                                 */
                         }
-                        if(memcmp(in_msg, "DONE", 4) == 0)            
+                        else if(memcmp(in_msg, "DONE", 4) == 0)            
                         {                                                   
                                 if(memcmp(in_msg+5, "BFLT", 4) == 0)
                                 {
-                                        pr_info(" client FWD:BFLT success\n");   
+                                        pr_info(" *** mtp | client FWD:BFLT "
+                                                "success | "
+                                                "tcp_client_fwd_filter ***\n");   
                                         goto success;                            
                                 }
                                 /*
@@ -249,14 +285,16 @@ resend:
                         }                                                
                         else                                              
                         {                                                 
-                                pr_info("client re-sending FRWD:BFLT\n");    
+                                pr_info(" *** mtp | client re-sending "
+                                        "FRWD:BFLT | tcp_client_fwd_filter ***\n");    
                                 goto resend;                                
                         }                                                     
                 }                                                             
         }                                                                    
         else                                                              
         {                                                                  
-                pr_info("client FWD:BFLT failed\n");                       
+                pr_info(" *** mtp | client FWD:BFLT failed | "
+                        "tcp_client_fwd_filter ***\n");                       
                 goto fail;                                                  
         }                                 
 
@@ -290,7 +328,7 @@ int tcp_client_connect(void)
         if(ret < 0)
         {
                 pr_info(" *** mtp | Error: %d while creating first socket. | "
-                        "setup_connection *** \n", ret);
+                        "tcp_client_connect ***\n", ret);
                 goto err;
         }
 
@@ -304,7 +342,7 @@ int tcp_client_connect(void)
         if(ret && (ret != -EINPROGRESS))
         {
                 pr_info(" *** mtp | Error: %d while connecting using conn "
-                        "socket. | setup_connection *** \n", ret);
+                        "socket. | tcp_client_connect ***\n", ret);
                 goto fail;
         }
 
@@ -312,10 +350,11 @@ int tcp_client_connect(void)
          * need.
          */
 //resend:
-        pr_info("client sending REGRS\n");
+        pr_info(" *** mtp | client sending REGRS | tcp_client_connect ***\n");
         memset(out_msg, 0, len+1);
         strcat(out_msg, "REGRS:2325"); 
-        tcp_client_send(cli_conn_socket, out_msg, strlen(out_msg), MSG_DONTWAIT);
+        tcp_client_send(cli_conn_socket, out_msg, strlen(out_msg),\
+                        MSG_DONTWAIT, 0);
 
         /* the wait_event_timeout is a better approach as, if the server
          * goes down then you can keep looping here (in this approach)
@@ -329,7 +368,8 @@ int tcp_client_connect(void)
         */
                 if(!skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue))
                 {
-                        pr_info("client receiving message\n");
+                        pr_info(" *** mtp | client receiving message | "
+                                "tcp_client_connect ****\n");
                         memset(in_msg, 0, len+1);
                         ret=tcp_client_receive(cli_conn_socket, in_msg,\
                                         MSG_DONTWAIT);
@@ -338,21 +378,24 @@ int tcp_client_connect(void)
                         {
                                 if(memcmp(in_msg, "RSREGD", 6) == 0)
                                 {
-                                        pr_info("client REGRS success\n");
+                                        pr_info(" *** mtp | client REGRS success"
+                                                " | tcp_client_connect ***\n");
                                         goto success; 
                                 }
                                 else
                                 {
                                         //pr_info("client re-sending REGRS\n");
                                         //goto resend;
-                                        pr_info("client REGRS failed\n");
+                                        pr_info(" *** mtp | client REGRS failed"
+                                                " | tcp_client_connect ***\n");
                                         goto fail;
                                 }
                         }
                 }
                 else
                 {
-                        pr_info("client REGRS failed\n");
+                        pr_info(" *** mtp | client REGRS failed | "
+                                " tcp_client_connect ***\n");
                         goto fail;
                 }
         /*
@@ -395,7 +438,7 @@ void tcp_client_exit(void)
         memset(&reply, 0, len+1);
         strcat(reply, "ADIOS"); 
         //tcp_client_send(cli_conn_socket, reply);
-        tcp_client_send(cli_conn_socket, reply, strlen(reply), MSG_DONTWAIT);
+        tcp_client_send(cli_conn_socket, reply, strlen(reply), MSG_DONTWAIT, 0);
 
         //while(1)
         //{
