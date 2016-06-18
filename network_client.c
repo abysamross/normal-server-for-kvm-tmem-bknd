@@ -53,13 +53,15 @@ u32 create_addr_from_str(char *str)
         return addr;
 }
 
-int tcp_client_send(struct socket *sock, const char *buf, const size_t length,\
-                unsigned long flags)
+int tcp_client_send(struct socket *sock, void *snd_buf, const size_t length,\
+                unsigned long flags, int huge)
 {
         struct msghdr msg;
         //struct iovec iov;
         struct kvec vec;
         int len, written = 0, left = length;
+        char *buf;
+
         mm_segment_t oldmm;
 
         msg.msg_name    = 0;
@@ -72,29 +74,43 @@ int tcp_client_send(struct socket *sock, const char *buf, const size_t length,\
         msg.msg_controllen = 0;
         msg.msg_flags   = flags;
 
+        buf = (char *)snd_buf;
+
         oldmm = get_fs(); set_fs(KERNEL_DS);
+
 repeat_send:
         /*
         msg.msg_iov->iov_len  = left;
         msg.msg_iov->iov_base = (char *)buf + written; 
         */
         vec.iov_len = left;
-        vec.iov_base = (char *)buf + written;
+
+        vec.iov_base = (char *)(buf + written);
 
         //len = sock_sendmsg(sock, &msg, left);
         //len = kernel_sendmsg(sock, &msg, &vec, 1???, left);????
         len = kernel_sendmsg(sock, &msg, &vec, left, left);
-        if((len == -ERESTARTSYS) || (!(flags & MSG_DONTWAIT) &&\
-                                (len == -EAGAIN)))
+
+        if((len == -ERESTARTSYS) || (!(flags & MSG_DONTWAIT) && (len == -EAGAIN)))
                 goto repeat_send;
-        if(len > 0)
+
+        pr_info("written: %d\n", len);
+
+        if(huge)
         {
-                written += len;
-                left -= len;
-                if(left)
-                        goto repeat_send;
+                if(len > 0)
+                {
+                        pr_info("written: %d\n", len);
+                        written += len;
+                        pr_info("total written: %d\n", written);
+                        left -= len;
+                        pr_info("left: %d\n", left);
+                        if(left)
+                                goto repeat_send;
+                }
         }
         set_fs(oldmm);
+        pr_info("return from send after writing total: %d bytes\n", written);
         return written ? written:len;
 }
 
@@ -155,6 +171,12 @@ int tcp_client_fwd_page(struct *page)
        send(page); 
        receive(response);
 }
+int tcp_client_passon(char *msg)
+{
+        tcp_client_send(cli_conn_socket, msg, strlen(msg),\
+                        MSG_DONTWAIT, 0);
+        return 0;
+}
 */
 
 int tcp_client_fwd_filter(struct bloom_filter *bflt)
@@ -163,39 +185,85 @@ int tcp_client_fwd_filter(struct bloom_filter *bflt)
         char in_msg[len+1];                                              
         char out_msg[len+1];                                            
         int ret;
-        const void *pg_vaddr;
+        //int attempts = 0;
+        void *vaddr;
         //unsigned long off;
         int size;
-        struct page *pg;
-        int pc = 0;
+        int i;
+        //struct page *pg;
+        //int pc = 0;
 
         DECLARE_WAIT_QUEUE_HEAD(bflt_wait);                               
-resend:                                                                  
-        pr_info("client sending FRWD:BFLT\n");                           
 
-        //size = (bflt->bitmap_bits_size) >> 3;
-        size = BITS_TO_LONGS(bflt->bitmap_bits_size)*sizeof(unsigned long);
+//bflt_resend:                                                                  
+        pr_info(" *** mtp | client sending FRWD:BFLT | "
+                "tcp_client_fwd_filter ***\n");                           
+
+        for(i = 0; i < bflt->bitmap_size; i++)
+                if(test_bit(i, bflt->bitmap))
+                        pr_info("bit: %d of bflt is set\n", i);
+
+        size = BITS_TO_LONGS(bflt->bitmap_size)*sizeof(unsigned long);
 
         memset(out_msg, 0, len+1);                                        
-        //strcat(out_msg, "FRWD:BFLT");                                     
+
         snprintf(out_msg, sizeof(out_msg), "FRWD:BFLT:%d",\
-                        bflt->bitmap_bits_size);
-        tcp_client_send(cli_conn_socket, out_msg, strlen(out_msg), MSG_DONTWAIT);
-                                                                          
+                        bflt->bitmap_size);
+
+        tcp_client_send(cli_conn_socket, out_msg, strlen(out_msg),\
+                        MSG_DONTWAIT, 0);
+fwd_bflt_wait:
+        /* this waiting thing can be made a parametrized funtion, the
+         * argument to which specifies the wait time*/
         wait_event_timeout(bflt_wait,\
                         !skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue),\
                                                                         10*HZ);   
         if(!skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue))              
         {                                                                        
-                pr_info("client receiving message\n");                           
+                pr_info(" *** mtp | client receiving message | "
+                        "tcp_client_fwd_filter ***\n");                           
                 memset(in_msg, 0, len+1);                                 
+
                 ret = tcp_client_receive(cli_conn_socket, in_msg, MSG_DONTWAIT); 
+
+                pr_info(" *** mtp | client received: %d bytes | "
+                        "tcp_client_fwd_filter ***\n", ret);                           
+
                 if(ret > 0)                                              
                 {
                         if(memcmp(in_msg, "SEND", 4) == 0)
                         {
                                 if(memcmp(in_msg+5, "BFLT", 4) == 0)
                                 {
+                                        //int tot_ret = 0;
+                                        //int n_pages = (size + PAGE_SIZE - 1)/PAGE_SIZE;
+                                        //int n_pages = CEILING(size, PAGE_SIZE);
+                                        //int j=0;
+                                        vaddr = 
+                                        (void*)((unsigned long)bflt->bitmap);
+
+                                        if(((unsigned long)bflt & (PAGE_SIZE-1))
+                                                      != 0)
+                                                pr_info(" *** mtp | bflt does "
+                                                        "not start from a page "
+                                                        "boundary | "
+                                                        "tcp_client_fwd_filter"
+                                                        " ***\n");
+
+                                        ret = tcp_client_send(cli_conn_socket, vaddr,\
+                                        size, MSG_DONTWAIT, 1);
+
+                                        /*
+                                        for(j = 0; j < n_pages; j++)
+                                        {
+                                                ret = 
+                                                tcp_client_send(cli_conn_socket, vaddr,\
+                                                PAGE_SIZE, MSG_DONTWAIT, 1);
+                                                vaddr += PAGE_SIZE;
+                                                tot_ret += ret;
+                                        }
+                                        */
+
                                         /* 
                                          * Can I assume that memory allocated
                                          * by vmalloc starts from a page
@@ -203,25 +271,53 @@ resend:
                                          * the offset within the page also, at
                                          * least for first page.
                                          */
-                                      if(((unsigned long)bflt & (PAGE_SIZE-1))
-                                                      != 0)
-                                                pr_info("bflt does not start "
-                                                        "from a page boundary\n");
 
-                                        pg_vaddr = 
-                                        (void*)((unsigned long)bflt & PAGE_MASK);
+                                        /* 
+                                         * if you failed to send the entire bloom
+                                         * filter you should inform this to
+                                         * leader server, who is wating for the
+                                         * entire size of bloom filter
+                                         */
+                                        pr_info(" *** mtp | client send: %d bytes | "
+                                                "as bflt tcp_client_fwd_filter ***\n", 
+                                                ret);                           
+
+                                        /* 
+                                         * this resending can also be taken out
+                                         * from here and done from the place
+                                         * where frwd_filter was originally
+                                         * called
+                                         */
                                         
-                                        for(;pg_vaddr <= (void *)(bflt + size);
-                                                        pg_vaddr += PAGE_SIZE)
+                                        if( ret != size)
                                         {
-                                                pg = vmalloc_to_page(pg_vaddr);
-                                                /*call kernel_sendpage*/
+                                                msleep(5000);
+                                                memset(out_msg, 0, len+1);                                        
+                                                strcat(out_msg, "FAIL");
+                                                ret = tcp_client_send(cli_conn_socket, out_msg,\
+                                                strlen(out_msg), MSG_DONTWAIT, 0);
+                                        
+                                        }
+
+                                        goto fwd_bflt_wait;
+                                        /*
+                                        if(ret != size)
+                                                goto bflt_fail;
+
+                                        goto fwd_bflt_wait;
+                                        */
+                                        /*
+                                        for(;vaddr <= (void *)(bflt + size);
+                                                        vaddr += PAGE_SIZE)
+                                        {
+                                                pg = vmalloc_to_page(vaddr);
                                                 kernel_sendpage(cli_conn_socket,\
                                                                pg, 0, PAGE_SIZE,\
                                                                MSG_DONTWAIT);
                                                 pr_info("page: %d sent\n", pc);
                                                 pc++;
                                         }
+                                        */
                                 }
                                 /*
                                 else if(memcmp(in_msg+4, "PAGE", 4) == 0)
@@ -233,12 +329,13 @@ resend:
                                 }
                                 */
                         }
-                        if(memcmp(in_msg, "DONE", 4) == 0)            
+                        else if(memcmp(in_msg, "DONE", 4) == 0)            
                         {                                                   
                                 if(memcmp(in_msg+5, "BFLT", 4) == 0)
                                 {
-                                        pr_info(" client FWD:BFLT success\n");   
-                                        goto success;                            
+                                        pr_info(" *** mtp | client FWD:BFLT "
+                                                "success | "
+                                                "tcp_client_fwd_filter ***\n");   
                                 }
                                 /*
                                 else if(memcmp(in_msg+5, "PAGE", 4) == 0)
@@ -249,20 +346,31 @@ resend:
                         }                                                
                         else                                              
                         {                                                 
-                                pr_info("client re-sending FRWD:BFLT\n");    
-                                goto resend;                                
+                                /*
+                                if(attempts == 1)
+                                        goto bflt_fail;
+
+                                pr_info(" *** mtp | client re-sending "
+                                        "FRWD:BFLT | tcp_client_fwd_filter ***\n");    
+                                attempts++;
+                                bflt_resend;
+                                */
+                                goto bflt_fail;                                
                         }                                                     
                 }                                                             
         }                                                                    
         else                                                              
         {                                                                  
-                pr_info("client FWD:BFLT failed\n");                       
-                goto fail;                                                  
+                pr_info(" *** mtp | client FWD:BFLT failed | "
+                        "tcp_client_fwd_filter ***\n");                       
+                goto bflt_fail;                                                  
         }                                 
 
-success:
+//bflt_success:
         return 0;
-fail:
+bflt_fail:
+        pr_info(" *** mtp | client FWD:BFLT failed | "
+                "tcp_client_fwd_filter ***\n");                       
         return -1;
 }
 
@@ -273,6 +381,7 @@ int tcp_client_connect(void)
         struct sockaddr_in daddr;
         struct socket *data_socket = NULL;
         */
+        //unsigned char destip[5] = {10,14,15,180,'\0'};
         unsigned char destip[5] = {10,129,41,200,'\0'};
         /*
         char *response = kmalloc(4096, GFP_KERNEL);
@@ -290,7 +399,7 @@ int tcp_client_connect(void)
         if(ret < 0)
         {
                 pr_info(" *** mtp | Error: %d while creating first socket. | "
-                        "setup_connection *** \n", ret);
+                        "tcp_client_connect ***\n", ret);
                 goto err;
         }
 
@@ -304,7 +413,7 @@ int tcp_client_connect(void)
         if(ret && (ret != -EINPROGRESS))
         {
                 pr_info(" *** mtp | Error: %d while connecting using conn "
-                        "socket. | setup_connection *** \n", ret);
+                        "socket. | tcp_client_connect ***\n", ret);
                 goto fail;
         }
 
@@ -312,24 +421,26 @@ int tcp_client_connect(void)
          * need.
          */
 //resend:
-        pr_info("client sending REGRS\n");
+        pr_info(" *** mtp | client sending REGRS | tcp_client_connect ***\n");
         memset(out_msg, 0, len+1);
         strcat(out_msg, "REGRS:2325"); 
-        tcp_client_send(cli_conn_socket, out_msg, strlen(out_msg), MSG_DONTWAIT);
+        tcp_client_send(cli_conn_socket, out_msg, strlen(out_msg),\
+                        MSG_DONTWAIT, 0);
 
         /* the wait_event_timeout is a better approach as, if the server
          * goes down then you can keep looping here (in this approach)
          */
         wait_event_timeout(reg_wait,\
                         !skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue),\
-                                                                        5*HZ);
+                                                                           5*HZ);
         /*
         while(1)
         {
         */
                 if(!skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue))
                 {
-                        pr_info("client receiving message\n");
+                        pr_info(" *** mtp | client receiving message | "
+                                "tcp_client_connect ****\n");
                         memset(in_msg, 0, len+1);
                         ret=tcp_client_receive(cli_conn_socket, in_msg,\
                                         MSG_DONTWAIT);
@@ -338,21 +449,24 @@ int tcp_client_connect(void)
                         {
                                 if(memcmp(in_msg, "RSREGD", 6) == 0)
                                 {
-                                        pr_info("client REGRS success\n");
+                                        pr_info(" *** mtp | client REGRS success"
+                                                " | tcp_client_connect ***\n");
                                         goto success; 
                                 }
                                 else
                                 {
                                         //pr_info("client re-sending REGRS\n");
                                         //goto resend;
-                                        pr_info("client REGRS failed\n");
+                                        pr_info(" *** 1. mtp | client REGRS failed"
+                                                " | tcp_client_connect ***\n");
                                         goto fail;
                                 }
                         }
                 }
                 else
                 {
-                        pr_info("client REGRS failed\n");
+                        pr_info(" *** 2. mtp | client REGRS failed | "
+                                " tcp_client_connect ***\n");
                         goto fail;
                 }
         /*
@@ -395,7 +509,7 @@ void tcp_client_exit(void)
         memset(&reply, 0, len+1);
         strcat(reply, "ADIOS"); 
         //tcp_client_send(cli_conn_socket, reply);
-        tcp_client_send(cli_conn_socket, reply, strlen(reply), MSG_DONTWAIT);
+        tcp_client_send(cli_conn_socket, reply, strlen(reply), MSG_DONTWAIT, 0);
 
         //while(1)
         //{
