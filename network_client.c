@@ -194,7 +194,6 @@ int tcp_client_fwd_filter(struct bloom_filter *bflt)
         //int pc = 0;
 
         DECLARE_WAIT_QUEUE_HEAD(bflt_wait);                               
-
 //bflt_resend:                                                                  
         pr_info(" *** mtp | client sending FRWD:BFLT | "
                 "tcp_client_fwd_filter ***\n");                           
