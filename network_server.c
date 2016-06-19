@@ -86,13 +86,13 @@ char *inet_ntoa(struct in_addr *in)
         int_ip = in->s_addr;
 
         sprintf(str_ip, "%d.%d.%d.%d", (int_ip) & 0xFF, (int_ip >> 8) & 0xFF,
-                                 (int_ip >> 16) & 0xFF, (int_ip >> 24) & 0xFF);
+                (int_ip >> 16) & 0xFF, (int_ip >> 24) & 0xFF);
         
         return str_ip;
 }
 
 int tcp_server_send(struct socket *sock, const char *buf, const size_t length,\
-                unsigned long flags)
+                    unsigned long flags)
 {
         struct msghdr msg;
         struct kvec vec;
@@ -114,8 +114,7 @@ repeat_send:
 
         len = kernel_sendmsg(sock, &msg, &vec, left, left);
         
-        if((len == -ERESTARTSYS) || (!(flags & MSG_DONTWAIT) &&\
-                                (len == -EAGAIN)))
+        if((len == -ERESTARTSYS) || (!(flags & MSG_DONTWAIT)&&(len == -EAGAIN)))
                 goto repeat_send;
 
         if(len > 0)
@@ -133,26 +132,17 @@ repeat_send:
 //int tcp_server_receive(struct socket *sock, int id,struct sockaddr_in *address,
 //                unsigned char *buf,int size, unsigned long flags)
 int tcp_server_receive(struct socket *sock, void *rcv_buf, int size,\
-                                        unsigned long flags, int huge)
+                       unsigned long flags, int huge)
 {
         struct msghdr msg;
         struct kvec vec;
-        int len, written = 0, left = size;
+        int len, totread = 0, left = size;
         char *buf = NULL;
-        unsigned long *bitmap;
         
         if(sock==NULL)
-        {
-                pr_info(" *** mtp | tcp server receive socket is NULL |"
-                        " tcp_server_receive *** \n");
                 return -1;
-        }
 
-        if(huge)
-                bitmap = (unsigned long *)rcv_buf;
-        else
-                buf = (char *)rcv_buf;
-
+        buf = (char *)rcv_buf;
 
         msg.msg_name = 0;
         msg.msg_namelen = 0;
@@ -160,20 +150,16 @@ int tcp_server_receive(struct socket *sock, void *rcv_buf, int size,\
         msg.msg_controllen = 0;
         msg.msg_flags = flags;
 
-
 read_again:
 
         vec.iov_len = left;
+        vec.iov_base = (char *)(buf + totread);
 
-        if(huge)
-                vec.iov_base = bitmap + written;
-        else
-                vec.iov_base = buf + written;
-
+        /*
         if(!skb_queue_empty(&sock->sk->sk_receive_queue))
                 pr_info("recv queue empty ? %s \n",
-                skb_queue_empty(&sock->sk->sk_receive_queue)?"yes":"no");
-
+                        skb_queue_empty(&sock->sk->sk_receive_queue)?"yes":"no");
+        */
         len = kernel_recvmsg(sock, &msg, &vec, size, size, flags);
 
         if(len == -EAGAIN || len == -ERESTARTSYS)
@@ -181,16 +167,27 @@ read_again:
         
         if(huge)
         {
+                /* 
+                 * you should timeout somehow if you cannot get the entire bloom
+                 * filter rather than simply looping around.
+                 */
                 if(len > 0)
                 {
-                        written += len;
+                        pr_info("len: %d\n", len);
+                        if((len == 4) && (memcmp(buf+totread, "FAIL", 4) == 0))
+                                goto recv_out;
+                        totread += len;
+                        pr_info("total read: %d\n", totread);
                         left -= len;
+                        pr_info("left: %d\n", left);
                         if(left)
                                 goto read_again;
                 }
         }
         //len = msg.msg_iter.kvec->iov_len;
-        return len;
+recv_out:
+        pr_info("returning from receive\n");
+        return totread?totread:len;
 }
 
 //struct remote_server *register_rs(struct socket *socket, char* pkt,
@@ -337,7 +334,8 @@ int receive_bflt(struct tcp_conn_handler_data *conn)
       int port, len = 49;
       char out_buf[len+1];
       unsigned long *bitmap = NULL;
-      int bmap_size;
+      int bmap_byte_size;
+      int bmap_bits_size;
       int i;
       int ret;
       //int bmap_bytes_size = 0;
@@ -353,10 +351,10 @@ int receive_bflt(struct tcp_conn_handler_data *conn)
       kstrtoint(tmp, 10, &port);
 
       tmp = strsep(&(conn->in_buf), ":");
-      kstrtoint(tmp, 10, &bmap_size);
+      kstrtoint(tmp, 10, &bmap_byte_size);
 
-      bitmap = vmalloc(bmap_size);
-      memset(bitmap, 0, bmap_size);
+      bitmap = vmalloc(bmap_byte_size);
+      memset(bitmap, 0, bmap_byte_size);
 
       if(!bitmap)
       {
@@ -393,22 +391,33 @@ int receive_bflt(struct tcp_conn_handler_data *conn)
                       MSG_DONTWAIT);
 
       ret = 
-      tcp_server_receive(conn->accept_socket, (void *)bitmap, bmap_size,\
+      tcp_server_receive(conn->accept_socket, (void *)bitmap, bmap_byte_size,\
                          MSG_DONTWAIT, 1);
 
-      pr_info(" *** mtp | server[%d] received bitmap (size: %d) of rs: %s | "
+      pr_info(" *** mtp | server[%d] received bitmap (size: %d) of rs: [%s] | "
               "receive_bflt ***\n", conn->thread_id, ret, ip);
 
+      if(ret != bmap_byte_size)
+      {
+              vfree(bitmap);
+              goto rcvfail;
+      }
+  
       /*free the bitmap for an existing server*/
       if(rs->rs_bitmap != NULL)
               vfree(rs->rs_bitmap);
 
       rs->rs_bitmap = bitmap;
 
-      pr_info(" *** mtp | server[%d] testing received bitmap of rs: %s\n"
+      pr_info(" *** mtp | server[%d] testing received bitmap of rs: [%s]\n"
               "bitmap[0]: %d, bitmap[10]: %d |\n receive_bflt ***\n", 
               conn->thread_id, ip, test_bit(0, rs->rs_bitmap),
               test_bit(0, rs->rs_bitmap));
+
+      bmap_bits_size = bmap_byte_size << 3;
+      for(i = 0; i < bmap_bits_size; i++)
+              if(test_bit(i, rs->rs_bitmap))
+                      pr_info("%d bit is set\n", i);
 
       return 0;
 
@@ -454,12 +463,13 @@ int connection_handler(void *data)
 
                               __set_current_state(TASK_RUNNING);
                               remove_wait_queue(&accept_socket->sk->sk_wq->wait,\
-                                              &recv_wait);
+                                                &recv_wait);
                               kfree(tcp_conn_handler->data[id]->address);
                               kfree(tcp_conn_handler->data[id]->ip);
                               kfree(tcp_conn_handler->data[id]);
                               //kfree(tmp);
-                        sock_release(tcp_conn_handler->data[id]->accept_socket);
+                              sock_release(tcp_conn_handler->data[id]->\
+                                           accept_socket);
                               return 0;
                       }
 
@@ -481,7 +491,7 @@ int connection_handler(void *data)
               //ret = tcp_server_receive(accept_socket, id, address, in_buf, len,
               //                         MSG_DONTWAIT);
               ret = tcp_server_receive(accept_socket, (void *)in_buf, len,\
-                                                        MSG_DONTWAIT, 0);
+                                       MSG_DONTWAIT, 0);
 
               pr_info(" *** mtp | server[%d] received: %d bytes from %s:%d, "
                       "says: %s | connection_handler ***\n",
@@ -582,8 +592,8 @@ int tcp_server_accept(void)
                 int addr_len;
 
                 accept_err =  
-                        sock_create(socket->sk->sk_family, socket->type,\
-                                    socket->sk->sk_protocol, &accept_socket);
+                sock_create(socket->sk->sk_family, socket->type,\
+                            socket->sk->sk_protocol, &accept_socket);
 
                 if(accept_err < 0 || !accept_socket)
                 {
@@ -610,12 +620,12 @@ int tcp_server_accept(void)
 
                        if(kthread_should_stop())
                        {
-                               pr_info(" *** mtp | 1. tcp server acceptor thread "
-                                       "stopped | tcp_server_accept *** \n");
+                               pr_info(" *** mtp | 1.tcp server acceptor thread"
+                                       " stopped | tcp_server_accept *** \n");
                                tcp_acceptor_stopped = 1;
                                __set_current_state(TASK_RUNNING);
                                remove_wait_queue(&socket->sk->sk_wq->wait,\
-                                               &accept_wait);
+                                                 &accept_wait);
                                sock_release(accept_socket);
                                return 0;
                        }
@@ -624,7 +634,7 @@ int tcp_server_accept(void)
                        {
                                __set_current_state(TASK_RUNNING);
                                remove_wait_queue(&socket->sk->sk_wq->wait,\
-                                               &accept_wait);
+                                                 &accept_wait);
                                goto release;
                        }
 
@@ -635,7 +645,7 @@ int tcp_server_accept(void)
                pr_info(" *** mtp | accept connection | tcp_server_accept ***\n");
 
                accept_err = 
-                       socket->ops->accept(socket, accept_socket, O_NONBLOCK);
+               socket->ops->accept(socket, accept_socket, O_NONBLOCK);
 
                if(accept_err < 0)
                {
@@ -651,9 +661,9 @@ int tcp_server_accept(void)
                addr_len = sizeof(struct sockaddr_in);
 
                accept_err = 
-               accept_socket->ops->getname(accept_socket,\
-                               (struct sockaddr *)client,\
-                               &addr_len, 2);
+               accept_socket->ops->getname(accept_socket,
+                                           (struct sockaddr *)client,\
+                                           &addr_len, 2);
 
                if(accept_err < 0)
                {
@@ -697,7 +707,7 @@ int tcp_server_accept(void)
                tcp_conn_handler->tcp_conn_handler_stopped[id] = 0;
                tcp_conn_handler->data[id] = data;
                tcp_conn_handler->thread[id] = 
-               kthread_run((void *)connection_handler, (void *)data, MODULE_NAME);
+               kthread_run((void *)connection_handler, (void *)data,MODULE_NAME);
 
                if(kthread_should_stop())
                {
@@ -735,7 +745,7 @@ int tcp_server_listen(void)
 
         tcp_listener_started = 1;
         server_err = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP,\
-                                &tcp_server->listen_socket);
+                                 &tcp_server->listen_socket);
         if(server_err < 0)
         {
                 pr_info(" *** mtp | Error: %d while creating tcp server "
@@ -752,7 +762,7 @@ int tcp_server_listen(void)
 
         server_err = 
         conn_socket->ops->bind(conn_socket, (struct sockaddr*)&server,\
-                        sizeof(server));
+                               sizeof(server));
 
         if(server_err < 0) {
                 pr_info(" *** mtp | Error: %d while binding tcp server "
@@ -771,7 +781,7 @@ int tcp_server_listen(void)
         }
 
         tcp_server->accept_thread = 
-                kthread_run((void*)tcp_server_accept, NULL, MODULE_NAME);
+        kthread_run((void*)tcp_server_accept, NULL, MODULE_NAME);
 
         while(1)
         {
@@ -802,8 +812,9 @@ err:
 int tcp_server_start(void)
 {
         tcp_server->running = 1;
-        tcp_server->thread = kthread_run((void *)tcp_server_listen, NULL,\
-                                        MODULE_NAME);
+        tcp_server->thread = 
+        kthread_run((void *)tcp_server_listen, NULL, MODULE_NAME);
+
         if(tcp_server->thread == NULL)
                 return -1;
         
@@ -828,7 +839,7 @@ static int __init network_server_init(void)
         memset(tcp_conn_handler, 0, sizeof(struct tcp_conn_handler));
 
         bitmap_bytes_size = 
-                BITS_TO_LONGS(bit_size)*sizeof(unsigned long);
+        BITS_TO_LONGS(bit_size)*sizeof(unsigned long);
         
         bflt = vmalloc(sizeof(*bflt)+bitmap_bytes_size);
         memset(bflt, 0, sizeof(*bflt)+bitmap_bytes_size);
@@ -883,7 +894,7 @@ static int __init network_server_init(void)
                 {
                         ret = kthread_stop(tcp_server->thread);
                         if(!ret)
-                                pr_info(" *** mtp | stopping tcp server listening"
+                                pr_info("*** mtp | stopping tcp server listening"
                                         " thread as local client could not setup"
                                         " a connection with leader server |"
                                         " network_server_init *** \n");
@@ -906,16 +917,8 @@ static int __init network_server_init(void)
         {
                 if(tcp_client_fwd_filter(bflt) < 0)
                 {
-                        /*
-                        char out[50];
-                        memset(out, 0, 50);
-                        strcat(out, "FAIL");
-                        msleep(5000);
-                        tcp_client_passon(out);
-                        */
-                        /*if you want try resending the bflt here*/
-                        pr_info(" *** mtp | tcp_client_fwd_filter attmept failed | "
-                                "network_server_init ***\n");
+                        pr_info(" *** mtp | tcp_client_fwd_filter 2 attmept "
+                                "failed | network_server_init ***\n");
                 }
         }
         else
@@ -943,14 +946,15 @@ static void __exit network_server_exit(void)
 
                         if(!tcp_conn_handler->tcp_conn_handler_stopped[id])
                                 {
-                                        ret = 
-                                kthread_stop(tcp_conn_handler->thread[id]);
+                                      ret = 
+                                      kthread_stop(tcp_conn_handler->thread[id]);
 
                                         if(!ret)
                                                 pr_info(" *** mtp | tcp server "
-                                                "connection handler thread: %d "
-                                                "stopped | network_server_exit "
-                                                "*** \n", id);
+                                                        "connection handler "
+                                                        "thread: %d stopped | "
+                                                        "network_server_exit "
+                                                        "*** \n", id);
                                 }
                        }
                 }
