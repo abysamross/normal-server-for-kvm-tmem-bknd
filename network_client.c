@@ -200,6 +200,8 @@ bflt_resend:
                         pr_info("bit: %d of bflt is set\n", i);
 
         size = BITS_TO_LONGS(bflt->bitmap_size)*sizeof(unsigned long);
+        pr_info(" *** mtp | bmap bits size: %d, bmap bytes size: %d | "
+                "tcp_client_fwd_filter\n", bflt->bitmap_size, size);
 
         memset(out_msg, 0, len+1);                                        
 
@@ -213,7 +215,7 @@ fwd_bflt_wait:
          * argument to which specifies the wait time*/
         wait_event_timeout(bflt_wait,\
                            !skb_queue_empty(&cli_conn_socket->sk->\
-                           sk_receive_queue),5*HZ);   
+                           sk_receive_queue), 10*HZ);   
 
         if(!skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue))              
         {                                                                        
@@ -393,6 +395,53 @@ bflt_fail:
         return -1;
 }
 
+int tcp_client_connect_rs(struct remote_server *rs)
+{
+        struct socket *conn_socket;
+        struct sockaddr_in saddr;
+        int port;
+        char *ip; 
+        int ret = -1;
+        //int id;
+
+        conn_socket = rs->lcc_socket;
+        ip = kmalloc(16*(sizeof(char)),GFP_KERNEL);
+        strcpy(ip, rs->rs_ip);
+        port = rs->rs_port; 
+        //id = rs->rs_id;
+
+        pr_info(" *** mtp | network client connecting to remote server: %s |"
+                " tcp_client_connect_rs *** \n", ip);
+
+        pr_info(" *** mtp | remote server destination ip: %s:%d | "
+                "tcp_client_connect_rs ***\n", ip, port);
+
+        memset(&saddr, 0, sizeof(saddr));
+        saddr.sin_family = AF_INET;
+        saddr.sin_port = htons(port);
+        saddr.sin_addr.s_addr = htonl(create_addr_from_str(ip));
+        kfree(ip);
+
+        ret = conn_socket->ops->connect(conn_socket, (struct sockaddr *)&saddr,\
+                                        sizeof(saddr), O_RDWR);
+        
+        pr_info(" *** mtp | connection attempt return value: %d | "
+                "tcp_client_connect_rs *** \n", ret);
+
+        if(ret && (ret != -EINPROGRESS))
+        {
+                pr_info(" *** mtp | network client error: %d while "
+                        "connecting to rs[%s] | tcp_client_connect_rs *** \n",
+                        ret, ip);
+                goto fail;
+        }
+
+        return 0;
+fail:
+        sock_release(conn_socket);
+        return -1;
+}
+
 int tcp_client_connect(void)
 {
         struct sockaddr_in saddr;
@@ -402,6 +451,7 @@ int tcp_client_connect(void)
         */
         //unsigned char destip[5] = {10,14,15,180,'\0'};
         unsigned char destip[5] = {10,129,41,200,'\0'};
+        //unsigned char destip[5] = {10,14,13,217,'\0'};
         /*
         char *response = kmalloc(4096, GFP_KERNEL);
         char *reply = kmalloc(4096, GFP_KERNEL);

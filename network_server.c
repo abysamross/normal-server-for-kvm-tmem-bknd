@@ -37,7 +37,7 @@ int bit_size = 268435456;
 //int bit_size = 33554432;
 struct bloom_filter *bflt = NULL;
 
-DEFINE_SPINLOCK(tcp_server_lock);
+//DEFINE_SPINLOCK(tcp_server_lock);
 static DECLARE_RWSEM(rs_rwmutex);
 LIST_HEAD(rs_head);
 
@@ -173,20 +173,21 @@ read_again:
                  */
                 if(len > 0)
                 {
-                        pr_info("len: %d\n", len);
+                        //pr_info("len: %d\n", len);
                         if((len == 4) && (memcmp(buf+totread, "FAIL", 4) == 0))
                                 goto recv_out;
                         totread += len;
-                        pr_info("total read: %d\n", totread);
+                        //pr_info("total read: %d\n", totread);
                         left -= len;
-                        pr_info("left: %d\n", left);
+                        //pr_info("left: %d\n", left);
                         if(left)
                                 goto read_again;
                 }
         }
         //len = msg.msg_iter.kvec->iov_len;
 recv_out:
-        pr_info("returning from receive\n");
+        pr_info(" *** mtp | return from receive after reading total: %d bytes, "
+                "last read: %d bytes | tcp_client_send \n", totread, len);
         return totread?totread:len;
 }
 
@@ -200,7 +201,7 @@ struct remote_server *register_rs(struct socket *socket, char* ip, int port)
 
         if(!rs)
                 return NULL;
-
+        memset(rs, 0, sizeof(struct remote_server));
         rs->lcc_socket = socket; 
         rs->rs_ip = ip;
         rs->rs_port = port;
@@ -248,6 +249,95 @@ int update_bflt(struct remote_server *rs)
         return 0;
 }
 */
+void deregister_rs(void)
+{
+        struct remote_server *rs = NULL;
+        struct list_head *pos = NULL;
+        struct list_head *pos_next = NULL;
+
+        down_write(&rs_rwmutex);
+        if(!(list_empty(&rs_head)))
+        {
+                //list_for_each_entry(rs_tmp, &(rs_head), rs_list)
+                list_for_each_safe(pos, pos_next, &(rs_head))
+                {
+                        rs = list_entry(pos, struct remote_server, rs_list);
+                        pr_info(" *** mtp | found remote server "
+                                "info:\n | ip-> %s | port-> %d "
+                                "| deregister_rs ***\n", 
+                                rs->rs_ip, rs->rs_port);
+
+                        list_del_init(&(rs->rs_list));
+                        //up_write(&rs_rwmutex);
+                        sock_release(rs->lcc_socket);
+                        if(rs->rs_ip != NULL)
+                                kfree(rs->rs_ip);
+                        if(rs->rs_bitmap)
+                                vfree(rs->rs_bitmap);
+                        kfree(rs);
+                }
+        }
+        up_write(&rs_rwmutex);
+
+}
+
+struct remote_server* look_up_rs(char *ip, int port)
+{
+        struct remote_server *rs_tmp;
+
+        down_read(&rs_rwmutex);
+        if(!(list_empty(&rs_head)))
+        {
+                list_for_each_entry(rs_tmp, &(rs_head), rs_list)
+                {
+                        up_read(&rs_rwmutex);
+                        if(strcmp(rs_tmp->rs_ip, ip) == 0)
+                        {
+                                pr_info(" *** mtp | found remote server "
+                                        "info:\n | ip-> %s | port-> %d "
+                                        "| look_up_rs ***\n", 
+                                        rs_tmp->rs_ip, rs_tmp->rs_port);
+
+                                return rs_tmp;
+                        }
+                        down_read(&rs_rwmutex);
+                }
+        }
+        //else
+        up_read(&rs_rwmutex);
+
+        return NULL;
+}
+
+void drop_connection(struct tcp_conn_handler_data *conn)
+{
+      struct remote_server *rs;
+      char *ip, *tmp;
+      int port;
+      int i = 0;
+
+      ip = kmalloc(16 * sizeof(char), GFP_KERNEL);
+      for(i = 0; i < 2; i++)
+              tmp = strsep(&(conn->in_buf), ":");
+      strcpy(ip, tmp);
+
+      tmp = strsep(&(conn->in_buf), ":");
+      kstrtoint(tmp, 10, &port);
+
+      rs = look_up_rs(ip, port);
+
+      if(rs != NULL)
+      {
+              down_write(&rs_rwmutex);
+              list_del_init(&(rs->rs_list));
+              up_write(&rs_rwmutex);
+              sock_release(rs->lcc_socket);
+              kfree(rs->rs_ip);
+              vfree(rs->rs_bitmap);
+              kfree(rs);
+      }
+      kfree(ip);
+}
 
 struct remote_server *create_and_register_rs(char *ip, int port)
 {
@@ -276,8 +366,7 @@ struct remote_server *create_and_register_rs(char *ip, int port)
                 goto fail;
         }
 
-        /*yet to implement this*/
-        //err = tcp_client_connect_rs(rs); 
+        err = tcp_client_connect_rs(rs);
 
         if(err < 0)
         {
@@ -298,33 +387,6 @@ fail:
         return NULL;
 }
 
-struct remote_server* look_up_rs(char *ip, int port)
-{
-        struct remote_server *rs_tmp;
-
-        down_read(&rs_rwmutex);
-        if(!(list_empty(&rs_head)))
-        {
-                list_for_each_entry(rs_tmp, &(rs_head), rs_list)
-                {
-                        up_read(&rs_rwmutex);
-        
-                        if(strcmp(rs_tmp->rs_ip, ip) == 0)
-                        {
-                                pr_info(" *** mtp | found remote server "
-                                        "info:\n | ip-> %s | port-> %d "
-                                        "look_up_rs ***\n", 
-                                        rs_tmp->rs_ip, rs_tmp->rs_port);
-
-                                return rs_tmp;
-                        }
-                }
-        }
-        else
-              up_read(&rs_rwmutex);
-
-        return NULL;
-}
 
 //int receive_bflt(struct socket *accept_socket, char *in_buf, int bmap_size)
 int receive_bflt(struct tcp_conn_handler_data *conn)
@@ -364,6 +426,30 @@ int receive_bflt(struct tcp_conn_handler_data *conn)
               goto rcvfail; 
       }
 
+      memset(out_buf, 0, len+1);
+      strcat(out_buf, "SEND:BFLT");
+       
+      pr_info(" *** mtp | server[%d] sending response: %s for bflt of rs: %s |"
+              " receive_bflt ***\n", conn->thread_id, out_buf, ip);
+        
+      ret =
+      tcp_server_send(conn->accept_socket,(void *)out_buf,strlen(out_buf),\
+                      MSG_DONTWAIT);
+
+      //receive actual bflt bitmap
+      ret = 
+      tcp_server_receive(conn->accept_socket, (void *)bitmap, bmap_byte_size,\
+                         MSG_DONTWAIT, 1);
+
+      pr_info(" *** mtp | server[%d] received bitmap (size: %d) of rs: [%s] | "
+              "receive_bflt ***\n", conn->thread_id, ret, ip);
+
+      if(ret != bmap_byte_size)
+      {
+              vfree(bitmap);
+              goto rcvfail;
+      }
+
       rs = look_up_rs(ip, port);
               
       if(rs == NULL)
@@ -376,31 +462,9 @@ int receive_bflt(struct tcp_conn_handler_data *conn)
                               " rs: %s failed | receive_bflt ***\n",
                               conn->thread_id, ip);
 
+                      vfree(bitmap);
                       goto rcvfail;
               }
-      }
-      //receive actual bflt bitmap
-      memset(out_buf, 0, len+1);
-      strcat(out_buf, "SEND:BFLT");
-       
-      pr_info(" *** mtp | server[%d] sending response: %s for bflt of rs: %s |"
-              " receive_bflt ***\n", conn->thread_id, out_buf, ip);
-        
-      ret =
-      tcp_server_send(conn->accept_socket,(void *)out_buf,strlen(out_buf),\
-                      MSG_DONTWAIT);
-
-      ret = 
-      tcp_server_receive(conn->accept_socket, (void *)bitmap, bmap_byte_size,\
-                         MSG_DONTWAIT, 1);
-
-      pr_info(" *** mtp | server[%d] received bitmap (size: %d) of rs: [%s] | "
-              "receive_bflt ***\n", conn->thread_id, ret, ip);
-
-      if(ret != bmap_byte_size)
-      {
-              vfree(bitmap);
-              goto rcvfail;
       }
   
       /*free the bitmap for an existing server*/
@@ -504,6 +568,7 @@ int connection_handler(void *data)
                               if(memcmp(in_buf+5, "BFLT", 4) == 0)
                               {
 
+                                      conn_data->in_buf = in_buf;
                                       if(receive_bflt(conn_data) < 0)
                                               goto bfltfail;
 
@@ -531,6 +596,12 @@ bfltresp:
                                       //bknd.
                                       //Give response.
                               }
+                      }
+                      else if(memcmp(in_buf, "QUIT", 4) == 0)
+                      {
+                              conn_data->in_buf = in_buf;
+                              drop_connection(conn_data);
+                      
                       }
                       else if(memcmp(in_buf, "ADIOS", 5) == 0)
                       {
@@ -993,6 +1064,7 @@ static void __exit network_server_exit(void)
                 }
         }
 
+        deregister_rs();
         pr_info(" *** mtp | network server module unloaded | "
                 "network_server_exit *** \n");
 }
