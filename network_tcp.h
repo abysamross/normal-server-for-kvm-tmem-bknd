@@ -31,6 +31,7 @@ extern int tcp_client_fwd_filter(struct bloom_filter *);
 extern int tcp_client_init(void);
 extern void tcp_client_exit(void);
 extern int tcp_client_connect_rs(struct remote_server *);
+extern int tcp_client_snd_page(struct remote_server *, struct page *);
 //extern int tcp_client_passon(char *);
 //extern struct bloom_filter *bflt;
 extern int bit_size;

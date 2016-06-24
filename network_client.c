@@ -156,25 +156,120 @@ read_again:
         return len;
 }
 
-/*
-int tcp_client_fwd_filter(struct *bloom_filter)
+int tcp_client_snd_page(struct remote_server *rs, struct page *page)
 {
-        send(bloom_filter);
-        receive(response);
-}
+        int ret = 0, len = 49;
+        char in_msg[len+1];
+        char out_msg[len+1];
+        void *vaddr;
+        struct socket *conn_socket; 
 
-int tcp_client_fwd_page(struct *page)
-{
-       send(page); 
-       receive(response);
-}
-int tcp_client_passon(char *msg)
-{
-        tcp_client_send(cli_conn_socket, msg, strlen(msg),\
-                        MSG_DONTWAIT, 0);
+        DECLARE_WAIT_QUEUE_HEAD(page_wait);                               
+
+        conn_socket = rs->lcc_socket;
+
+        pr_info(" *** mtp | client sending RECV:PAGE to: %s | "
+                "tcp_client_snd_page ***\n", rs->rs_ip);                           
+
+        memset(out_msg, 0, len+1);                                        
+
+        snprintf(out_msg, sizeof(out_msg), "RECV:PAGE");
+
+        tcp_client_send(conn_socket, out_msg, strlen(out_msg), MSG_DONTWAIT, 0);
+        
+snd_page_wait:
+
+        wait_event_timeout(page_wait,\
+                           !skb_queue_empty(&conn_socket->sk->sk_receive_queue),\
+                           10*HZ);   
+
+        if(!skb_queue_empty(&conn_socket->sk->sk_receive_queue))              
+        {
+                pr_info(" *** mtp | client receiving message | "
+                        "tcp_client_snd_page ***\n");                           
+                memset(in_msg, 0, len+1);                                 
+
+                ret = tcp_client_receive(conn_socket, in_msg, MSG_DONTWAIT); 
+
+                pr_info(" *** mtp | client received: %d bytes | "
+                        "tcp_client_snd_page ***\n", ret);
+        
+                if(ret > 0)                                              
+                {
+                        if(memcmp(in_msg, "SEND", 4) == 0)
+                        {
+                                if(memcmp(in_msg+5, "PAGE", 4) == 0)
+                                {
+                                        vaddr = page_address(page);
+
+                                        /*
+                                        ret = 
+                                        tcp_client_send(conn_socket, vaddr,\
+                                                        PAGE_SIZE,MSG_DONTWAIT,1);
+                                        */
+                                        ret = 
+                                        kernel_sendpage(conn_socket, page, 0,\
+                                                        PAGE_SIZE, MSG_DONTWAIT);
+
+                                        if(ret != PAGE_SIZE)
+                                        {
+                                                msleep(5000);
+                                                memset(out_msg, 0, len+1);        
+                                                strcat(out_msg, "FAIL");
+                                                ret = 
+                                                tcp_client_send(conn_socket,\
+                                                                out_msg,\
+                                                                strlen(out_msg),\
+                                                                MSG_DONTWAIT, 0);
+                                                goto page_fail;
+                                        }
+
+                                        pr_info(" *** mtp | page "
+                                                "send to: %s | "
+                                                "tcp_client_snd_page *** \n",
+                                                rs->rs_ip);
+
+                                        goto snd_page_wait;
+                                }
+                        }
+                        else if(memcmp(in_msg, "FNDS", 4) == 0)
+                        {
+                                if(memcmp(in_msg+5, "PAGE", 4) == 0)
+                                {
+                                        pr_info(" *** mtp | SUCCESS: page "
+                                                "found at: %s | "
+                                                "tcp_client_snd_page *** \n",
+                                                rs->rs_ip);
+                                }
+                        }
+                        else if(memcmp(in_msg, "FAIL", 4) == 0)
+                        {
+                                if(memcmp(in_msg+5, "PAGE", 4) == 0)
+                                {
+                                        pr_info(" *** mtp | FAIL: page "
+                                                "not found at: %s | "
+                                                "tcp_client_snd_page *** \n",
+                                                rs->rs_ip);
+                                }
+                        }
+                        else
+                                goto page_fail;
+                }
+        }
+        else                                                              
+        {                                                                  
+                pr_info(" *** mtp | client RECV:PAGE:%s failed | "
+                        "tcp_client_snd_page ***\n", rs->rs_ip);
+
+                goto page_fail;                                                  
+        }
+
         return 0;
+
+page_fail:
+
+         return -1;
 }
-*/
 
 int tcp_client_fwd_filter(struct bloom_filter *bflt)
 {                                                     
@@ -281,7 +376,7 @@ fwd_bflt_wait:
                                          * entire size of bloom filter
                                          */
                                         pr_info(" *** mtp | client send: %d "
-                                                "bytes | as bflt "
+                                                "bytes as bflt | "
                                                 "tcp_client_fwd_filter ***\n", 
                                                 ret);                           
 

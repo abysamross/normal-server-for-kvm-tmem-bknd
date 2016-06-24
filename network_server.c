@@ -41,6 +41,9 @@ struct bloom_filter *bflt = NULL;
 static DECLARE_RWSEM(rs_rwmutex);
 LIST_HEAD(rs_head);
 
+struct page *test_page;
+void *test_page_vaddr;
+
 struct tcp_conn_handler_data
 {
         struct sockaddr_in *address;
@@ -191,6 +194,100 @@ recv_out:
         return totread?totread:len;
 }
 
+int compare_page(struct page *new_page, void *new_page_vaddr)
+{
+        void *vaddr;
+        int ret1 = 0;
+        int ret2 = 0;
+
+        vaddr = page_address(new_page);
+        
+        ret1 = memcmp(vaddr, test_page_vaddr, PAGE_SIZE);
+        pr_info(" *** mtp | page test 1 result: %d | compare_page ***\n", ret1);
+
+        ret2 = memcmp(new_page_vaddr, test_page_vaddr, PAGE_SIZE);
+        pr_info(" *** mtp | page test 2 result: %d | compare_page ***\n", ret2);
+
+        if((ret1 == 0) && (ret2 == 0))
+        {
+                pr_info(" *** mtp | page tests passed | compare_page ***\n");
+                return 0;
+        }
+
+        return -1;
+}
+
+int rcv_and_cmp_page(struct tcp_conn_handler_data *conn)
+{
+        int ret, len = 49;
+        //int i;
+        char out_buf[len+1];
+        //char *ip, *tmp;
+        struct page *new_page = NULL;
+        void *new_page_vaddr;
+
+        new_page = alloc_page(GFP_ATOMIC);
+
+        if(new_page == NULL)
+                goto recv_page_fail;
+
+        new_page_vaddr = page_address(new_page);
+        memset(new_page_vaddr, 0, PAGE_SIZE);
+
+        /* 
+         * the lines above can be replaced by the following single line 
+         * new_page_vaddr = get_zeroed_page(GFP_ATOMIC);
+         */
+
+        /*
+        ip = kmalloc(16 * sizeof(char), GFP_KERNEL);
+
+        for(i = 0; i < 3; i++)
+              tmp = strsep(&(conn->in_buf), ":");
+
+        strcpy(ip, tmp);
+        */
+
+        /*
+        tmp = strsep(&(conn->in_buf), ":");
+        kstrtoint(tmp, 10, &port);
+
+        tmp = strsep(&(conn->in_buf), ":");
+        kstrtoint(tmp, 10, &bmap_byte_size);
+
+        bitmap = vmalloc(bmap_byte_size);
+        memset(bitmap, 0, bmap_byte_size);
+        */
+
+        memset(out_buf, 0, len+1);
+        strcat(out_buf, "SEND:PAGE");
+
+        pr_info(" *** mtp | server[%d] sending response: %s for page of rs: %s"
+                " | rcv_and_cmp_page ***\n", conn->thread_id, out_buf, conn->ip);
+
+        ret =
+        tcp_server_send(conn->accept_socket,(void *)out_buf,strlen(out_buf),\
+                        MSG_DONTWAIT);
+
+        ret = 
+        tcp_server_receive(conn->accept_socket, new_page_vaddr, PAGE_SIZE,\
+                           MSG_DONTWAIT, 1);
+
+        pr_info(" *** mtp | server[%d] received page (size: %d) of rs: [%s] | "
+                "rcv_and_cmp_page ***\n", conn->thread_id, ret, conn->ip);
+
+        if(ret != PAGE_SIZE)
+                goto recv_page_fail;
+
+        if(compare_page(new_page, new_page_vaddr) < 0)
+                goto recv_page_fail;
+
+        return 0;
+
+recv_page_fail:
+
+        return -1;
+}
 //struct remote_server *register_rs(struct socket *socket, char* pkt,
 //                int id, struct sockaddr_in *address)
 struct remote_server *register_rs(struct socket *socket, char* ip, int port)
@@ -249,6 +346,12 @@ int update_bflt(struct remote_server *rs)
         return 0;
 }
 */
+
+/*
+ * NOTE:
+ * deregister_rs and snd_page are not called in response to a message from a
+ * remote server.
+ */
 void deregister_rs(void)
 {
         struct remote_server *rs = NULL;
@@ -279,6 +382,37 @@ void deregister_rs(void)
         }
         up_write(&rs_rwmutex);
 
+}
+
+void  snd_page(struct page *page)
+{
+        struct remote_server *rs_tmp;
+
+        down_read(&rs_rwmutex);
+        if(!(list_empty(&rs_head)))
+        {
+                /* 
+                 * sending this page to everybody is not my aim;
+                 * in actual scenario the page has to be sent to an 
+                 * RS in whose bloom filter it was a hit
+                 */
+                list_for_each_entry(rs_tmp, &(rs_head), rs_list)
+                {
+                        up_read(&rs_rwmutex);
+                        pr_info(" *** mtp | found remote server "
+                                "info:\n | ip-> %s | port-> %d "
+                                "| snd_page ***\n", 
+                                rs_tmp->rs_ip, rs_tmp->rs_port);
+
+                        if(tcp_client_snd_page(rs_tmp, page) < 0)
+                                pr_info(" *** mtp | page was not found with RS"
+                                        ": %s | snd_page *** \n", 
+                                        rs_tmp->rs_ip);
+                        down_read(&rs_rwmutex);
+                }
+        }
+        //else
+        up_read(&rs_rwmutex);
 }
 
 struct remote_server* look_up_rs(char *ip, int port)
@@ -588,13 +722,33 @@ bfltresp:
                                       tcp_server_send(accept_socket, out_buf,\
                                                       strlen(out_buf),\
                                                       MSG_DONTWAIT);
+
+                                      pr_info(" *** mtp | sending test page |"
+                                              " connection_handler ***\n");
+
+                                      if(test_page != NULL)
+                                              snd_page(test_page);
                               }
-                              else if(memcmp(in_buf+4, "PAGE", 4) == 0)
+                              else if(memcmp(in_buf+5, "PAGE", 4) == 0)
                               {
                                       //obtain ip or unique id from in_buf
                                       //do comparison of this page in the tmem
                                       //bknd.
                                       //Give response.
+                                      conn_data->in_buf = in_buf;
+                                      if(rcv_and_cmp_page(conn_data) < 0)
+                                              goto pagefail;
+
+                                      memset(out_buf, 0, len+1);
+                                      strcat(out_buf, "FNDS:PAGE");
+                                      goto pageresp;
+pagefail:
+                                      memset(out_buf, 0, len+1);
+                                      strcat(out_buf, "FAIL:PAGE");
+pageresp: 
+                                      tcp_server_send(accept_socket, out_buf,\
+                                                      strlen(out_buf),\
+                                                      MSG_DONTWAIT);
                               }
                       }
                       else if(memcmp(in_buf, "QUIT", 4) == 0)
@@ -902,6 +1056,18 @@ static int __init network_server_init(void)
 
         pr_info(" *** mtp | initiating network_server | "
                 "network_server_init ***\n");
+
+        test_page = alloc_page(GFP_ATOMIC);
+
+        if(test_page != NULL)
+        {
+                pr_info(" *** mtp | test_page allocated successfully | "
+                        "network_server_init *** \n");
+                test_page_vaddr = page_address(test_page);
+                memset(test_page_vaddr, 0, PAGE_SIZE);
+                strcat(test_page_vaddr, 
+                       "HOLA AMIGO, MI LLAMA ABY, Y TU?");
+        }
 
         tcp_server = kmalloc(sizeof(struct tcp_server_service), GFP_KERNEL);
         memset(tcp_server, 0, sizeof(struct tcp_server_service));
