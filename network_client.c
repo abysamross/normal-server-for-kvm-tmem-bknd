@@ -286,15 +286,22 @@ int tcp_client_fwd_filter(struct bloom_filter *bflt)
         //int pc = 0;
 
         DECLARE_WAIT_QUEUE_HEAD(bflt_wait);                               
+
 bflt_resend:                                                                  
+
         pr_info(" *** mtp | client sending FRWD:BFLT | "
                 "tcp_client_fwd_filter ***\n");                           
+
+        mutex_lock(&bflt->lock);
 
         for(i = 0; i < bflt->bitmap_size; i++)
                 if(test_bit(i, bflt->bitmap))
                         pr_info("bit: %d of bflt is set\n", i);
 
+        mutex_unlock(&bflt->lock);
+
         size = BITS_TO_LONGS(bflt->bitmap_size)*sizeof(unsigned long);
+
         pr_info(" *** mtp | bmap bits size: %d, bmap bytes size: %d | "
                 "tcp_client_fwd_filter\n", bflt->bitmap_size, size);
 
@@ -344,10 +351,18 @@ fwd_bflt_wait:
                                                         "boundary | "
                                                         "tcp_client_fwd_filter"
                                                         " ***\n");
+                                        /* 
+                                         * should I lock the bloom filter before
+                                         * sending it??
+                                         */
+
+                                        //mutex_lock(&bflt->lock);
 
                                         ret = 
                                         tcp_client_send(cli_conn_socket, vaddr,\
                                                         size, MSG_DONTWAIT, 1);
+
+                                        //mutex_unlock(&bflt->lock);
 
                                         /*
                                         for(j = 0; j < n_pages; j++)
@@ -608,7 +623,9 @@ int tcp_client_connect(void)
                 {
                         pr_info(" *** mtp | client receiving message | "
                                 "tcp_client_connect ****\n");
+
                         memset(in_msg, 0, len+1);
+
                         ret=tcp_client_receive(cli_conn_socket, in_msg,\
                                                MSG_DONTWAIT);
 

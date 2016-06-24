@@ -38,7 +38,8 @@ int bit_size = 268435456;
 struct bloom_filter *bflt = NULL;
 
 //DEFINE_SPINLOCK(tcp_server_lock);
-static DECLARE_RWSEM(rs_rwmutex);
+//static DECLARE_RWSEM(rs_rwmutex);
+static DEFINE_RWLOCK(rs_rwspinlock);
 LIST_HEAD(rs_head);
 
 struct page *test_page;
@@ -194,6 +195,27 @@ recv_out:
         return totread?totread:len;
 }
 
+struct bloom_filter *bloom_filter_new(int bit_size)
+{
+	struct bloom_filter *filter;
+	unsigned long bitmap_size = BITS_TO_LONGS(bit_size)
+				  * sizeof(unsigned long);
+
+	//filter = kzalloc(sizeof(*filter) + bitmap_size, GFP_KERNEL);
+	filter = vmalloc(sizeof(*filter) + bitmap_size);
+        memset(filter, 0, sizeof(*filter) + bitmap_size);
+
+	if (!filter)
+		return ERR_PTR(-ENOMEM);
+
+	kref_init(&filter->kref);
+	mutex_init(&filter->lock);
+	filter->bitmap_size = bit_size;
+	INIT_LIST_HEAD(&filter->alg_list);
+
+	return filter;
+}
+
 int compare_page(struct page *new_page, void *new_page_vaddr)
 {
         void *vaddr;
@@ -302,15 +324,18 @@ struct remote_server *register_rs(struct socket *socket, char* ip, int port)
         rs->lcc_socket = socket; 
         rs->rs_ip = ip;
         rs->rs_port = port;
-        rs->rs_bitmap = NULL;
+        //rs->rs_bitmap = NULL;
         rs->rs_bmap_size = 0;
+        rs->rs_bflt = NULL;
         
         pr_info(" *** mtp | registered remote server with ip: %s:%d | "
                 "register_rs ***\n", rs->rs_ip, rs->rs_port);
 
-        down_write(&rs_rwmutex);
+        //down_write(&rs_rwmutex);
+        write_lock(&rs_rwspinlock);
         list_add_tail(&(rs->rs_list), &(rs_head));
-        up_write(&rs_rwmutex);
+        write_unlock(&rs_rwspinlock);
+        //up_write(&rs_rwmutex);
 
         return rs;
 }
@@ -358,7 +383,8 @@ void deregister_rs(void)
         struct list_head *pos = NULL;
         struct list_head *pos_next = NULL;
 
-        down_write(&rs_rwmutex);
+        //down_write(&rs_rwmutex);
+        write_lock(&rs_rwspinlock);
         if(!(list_empty(&rs_head)))
         {
                 //list_for_each_entry(rs_tmp, &(rs_head), rs_list)
@@ -371,24 +397,25 @@ void deregister_rs(void)
                                 rs->rs_ip, rs->rs_port);
 
                         list_del_init(&(rs->rs_list));
-                        //up_write(&rs_rwmutex);
                         sock_release(rs->lcc_socket);
                         if(rs->rs_ip != NULL)
                                 kfree(rs->rs_ip);
-                        if(rs->rs_bitmap)
-                                vfree(rs->rs_bitmap);
+                        if(rs->rs_bflt)
+                                vfree(rs->rs_bflt);
                         kfree(rs);
                 }
         }
-        up_write(&rs_rwmutex);
+        write_unlock(&rs_rwspinlock);
+        //up_write(&rs_rwmutex);
 
 }
 
-void  snd_page(struct page *page)
+void snd_page(struct page *page)
 {
         struct remote_server *rs_tmp;
 
-        down_read(&rs_rwmutex);
+        //down_read(&rs_rwmutex);
+        read_lock(&rs_rwspinlock);
         if(!(list_empty(&rs_head)))
         {
                 /* 
@@ -398,7 +425,8 @@ void  snd_page(struct page *page)
                  */
                 list_for_each_entry(rs_tmp, &(rs_head), rs_list)
                 {
-                        up_read(&rs_rwmutex);
+                        //up_read(&rs_rwmutex);
+                        read_unlock(&rs_rwspinlock);
                         pr_info(" *** mtp | found remote server "
                                 "info:\n | ip-> %s | port-> %d "
                                 "| snd_page ***\n", 
@@ -408,23 +436,27 @@ void  snd_page(struct page *page)
                                 pr_info(" *** mtp | page was not found with RS"
                                         ": %s | snd_page *** \n", 
                                         rs_tmp->rs_ip);
-                        down_read(&rs_rwmutex);
+                        read_lock(&rs_rwspinlock);
+                        //down_read(&rs_rwmutex);
                 }
         }
         //else
-        up_read(&rs_rwmutex);
+        read_unlock(&rs_rwspinlock);
+        //up_read(&rs_rwmutex);
 }
 
 struct remote_server* look_up_rs(char *ip, int port)
 {
         struct remote_server *rs_tmp;
 
-        down_read(&rs_rwmutex);
+        //down_read(&rs_rwmutex);
+        read_lock(&rs_rwspinlock);
         if(!(list_empty(&rs_head)))
         {
                 list_for_each_entry(rs_tmp, &(rs_head), rs_list)
                 {
-                        up_read(&rs_rwmutex);
+                        //up_read(&rs_rwmutex);
+                        read_unlock(&rs_rwspinlock);
                         if(strcmp(rs_tmp->rs_ip, ip) == 0)
                         {
                                 pr_info(" *** mtp | found remote server "
@@ -434,11 +466,13 @@ struct remote_server* look_up_rs(char *ip, int port)
 
                                 return rs_tmp;
                         }
-                        down_read(&rs_rwmutex);
+                        read_lock(&rs_rwspinlock);
+                        //down_read(&rs_rwmutex);
                 }
         }
         //else
-        up_read(&rs_rwmutex);
+        read_unlock(&rs_rwspinlock);
+        //up_read(&rs_rwmutex);
 
         return NULL;
 }
@@ -462,12 +496,15 @@ void drop_connection(struct tcp_conn_handler_data *conn)
 
       if(rs != NULL)
       {
-              down_write(&rs_rwmutex);
+              //down_write(&rs_rwmutex);
+              write_lock(&rs_rwspinlock);
               list_del_init(&(rs->rs_list));
-              up_write(&rs_rwmutex);
+              write_unlock(&rs_rwspinlock);
+              //up_write(&rs_rwmutex);
               sock_release(rs->lcc_socket);
               kfree(rs->rs_ip);
-              vfree(rs->rs_bitmap);
+              //vfree(rs->rs_bitmap);
+              vfree(rs->rs_bflt);
               kfree(rs);
       }
       kfree(ip);
@@ -508,9 +545,11 @@ struct remote_server *create_and_register_rs(char *ip, int port)
                       "this server to rs:%s |"
                       " create_and_register_rs ***\n", err, ip);
 
-              down_write(&rs_rwmutex);
+              //down_write(&rs_rwmutex);
+              write_lock(&rs_rwspinlock);
               list_del_init(&(rs->rs_list));
-              up_write(&rs_rwmutex);
+              write_unlock(&rs_rwspinlock);
+              //up_write(&rs_rwmutex);
               kfree(rs->rs_ip);
               kfree(rs);
               goto fail;
@@ -526,10 +565,11 @@ fail:
 int receive_bflt(struct tcp_conn_handler_data *conn)
 {
       struct remote_server *rs;
+      struct bloom_filter *bflt;
       char *ip, *tmp;
       int port, len = 49;
       char out_buf[len+1];
-      unsigned long *bitmap = NULL;
+      //unsigned long *bitmap = NULL;
       int bmap_byte_size;
       int bmap_bits_size;
       int i;
@@ -547,12 +587,28 @@ int receive_bflt(struct tcp_conn_handler_data *conn)
       kstrtoint(tmp, 10, &port);
 
       tmp = strsep(&(conn->in_buf), ":");
-      kstrtoint(tmp, 10, &bmap_byte_size);
+      kstrtoint(tmp, 10, &bmap_bits_size);
 
+      bmap_byte_size = BITS_TO_LONGS(bmap_bits_size)*sizeof(unsigned long);
+
+      /*
       bitmap = vmalloc(bmap_byte_size);
       memset(bitmap, 0, bmap_byte_size);
+      */
 
+      bflt = bloom_filter_new(bmap_bits_size);
+
+      /*
       if(!bitmap)
+      {
+              pr_info("server[%d] failed to allocate memory for bflt of "
+                      "rs: %s | receive_bflt ***\n", conn->thread_id, ip);
+              kfree(ip);
+              goto rcvfail; 
+      }
+      */
+
+      if(IS_ERR(bflt))
       {
               pr_info("server[%d] failed to allocate memory for bflt of "
                       "rs: %s | receive_bflt ***\n", conn->thread_id, ip);
@@ -572,15 +628,16 @@ int receive_bflt(struct tcp_conn_handler_data *conn)
 
       //receive actual bflt bitmap
       ret = 
-      tcp_server_receive(conn->accept_socket, (void *)bitmap, bmap_byte_size,\
-                         MSG_DONTWAIT, 1);
+      tcp_server_receive(conn->accept_socket, (void *)bflt->bitmap,\
+                         bmap_byte_size, MSG_DONTWAIT, 1);
 
       pr_info(" *** mtp | server[%d] received bitmap (size: %d) of rs: [%s] | "
               "receive_bflt ***\n", conn->thread_id, ret, ip);
 
       if(ret != bmap_byte_size)
       {
-              vfree(bitmap);
+              kfree(ip);
+              vfree(bflt);
               goto rcvfail;
       }
 
@@ -596,30 +653,31 @@ int receive_bflt(struct tcp_conn_handler_data *conn)
                               " rs: %s failed | receive_bflt ***\n",
                               conn->thread_id, ip);
 
-                      vfree(bitmap);
+                      //vfree(bitmap);
                       goto rcvfail;
               }
       }
-  
-      /*free the bitmap for an existing server*/
-      if(rs->rs_bitmap != NULL)
-              vfree(rs->rs_bitmap);
 
-      rs->rs_bitmap = bitmap;
+      /*free the bitmap for an existing server*/
+      if(rs->rs_bflt != NULL)
+              vfree(rs->rs_bflt);
+
+      rs->rs_bflt = bflt;
 
       pr_info(" *** mtp | server[%d] testing received bitmap of rs: [%s]\n"
               "bitmap[0]: %d, bitmap[10]: %d |\n receive_bflt ***\n", 
-              conn->thread_id, ip, test_bit(0, rs->rs_bitmap),
-              test_bit(0, rs->rs_bitmap));
+              conn->thread_id, ip, test_bit(0, rs->rs_bflt->bitmap),
+              test_bit(0, rs->rs_bflt->bitmap));
 
-      bmap_bits_size = bmap_byte_size << 3;
+      //bmap_bits_size = bmap_byte_size << 3;
       for(i = 0; i < bmap_bits_size; i++)
-              if(test_bit(i, rs->rs_bitmap))
+              if(test_bit(i, rs->rs_bflt->bitmap))
                       pr_info("%d bit is set\n", i);
 
       return 0;
 
 rcvfail:
+
       return -1;
 }
 
@@ -1052,7 +1110,7 @@ int tcp_server_start(void)
 static int __init network_server_init(void)
 {
         struct bloom_filter *bflt = NULL;
-        unsigned long bitmap_bytes_size; 
+        //unsigned long bitmap_bytes_size; 
 
         pr_info(" *** mtp | initiating network_server | "
                 "network_server_init ***\n");
@@ -1075,11 +1133,14 @@ static int __init network_server_init(void)
         tcp_conn_handler = kmalloc(sizeof(struct tcp_conn_handler), GFP_KERNEL);
         memset(tcp_conn_handler, 0, sizeof(struct tcp_conn_handler));
 
+        /*
         bitmap_bytes_size = 
         BITS_TO_LONGS(bit_size)*sizeof(unsigned long);
         
         bflt = vmalloc(sizeof(*bflt)+bitmap_bytes_size);
         memset(bflt, 0, sizeof(*bflt)+bitmap_bytes_size);
+        */
+        bflt = bloom_filter_new(bit_size);
 
         if(!bflt)
         {
@@ -1154,7 +1215,7 @@ static int __init network_server_init(void)
         {
                 if(tcp_client_fwd_filter(bflt) < 0)
                 {
-                        pr_info(" *** mtp | tcp_client_fwd_filter 2 attmept "
+                        pr_info(" *** mtp | tcp_client_fwd_filter 2 attmepts "
                                 "failed | network_server_init ***\n");
                 }
         }

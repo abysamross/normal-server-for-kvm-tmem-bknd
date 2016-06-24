@@ -21,9 +21,10 @@ struct remote_server
         int rs_port;
         //struct sockaddr_in *rs_addr;
         //unsigned long rs_bitmap[0];
-        unsigned long *rs_bitmap;
+        //unsigned long *rs_bitmap;
         int rs_bmap_size;
         struct list_head rs_list;
+        struct bloom_filter *rs_bflt;
 };
 
 extern struct socket *cli_conn_socket;
@@ -32,7 +33,9 @@ extern int tcp_client_init(void);
 extern void tcp_client_exit(void);
 extern int tcp_client_connect_rs(struct remote_server *);
 extern int tcp_client_snd_page(struct remote_server *, struct page *);
-//extern int tcp_client_passon(char *);
-//extern struct bloom_filter *bflt;
+/*
+extern int tcp_client_passon(char *);
+extern struct bloom_filter *bflt;
+*/
 extern int bit_size;
 #endif
