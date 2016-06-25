@@ -28,22 +28,27 @@ MODULE_AUTHOR("Aby Sam Ross");
 #define MODULE_NAME "tmem_tcp_server"
 #define MAX_CONNS 16
 
+static DEFINE_RWLOCK(rs_rwspinlock);
+LIST_HEAD(rs_head);
+
+int bit_size = 268435456;
+int delay = 60;
 static int tcp_listener_stopped = 0;
 static int tcp_listener_started = 0;
 static int tcp_acceptor_stopped = 0;
 static int tcp_acceptor_started = 0;
-//struct socket *client_conn_socket = NULL;
-int bit_size = 268435456;
-//int bit_size = 33554432;
-struct bloom_filter *bflt = NULL;
+static int timed_fwd_filter_stopped = 0;
 
-//DEFINE_SPINLOCK(tcp_server_lock);
-//static DECLARE_RWSEM(rs_rwmutex);
-static DEFINE_RWLOCK(rs_rwspinlock);
-LIST_HEAD(rs_head);
-
-struct page *test_page;
 void *test_page_vaddr;
+struct page *test_page;
+struct bloom_filter *bflt = NULL;
+struct task_struct *fwd_bflt_thread = NULL;
+
+/*
+int bit_size = 33554432;
+DEFINE_SPINLOCK(tcp_server_lock);
+static DECLARE_RWSEM(rs_rwmutex);
+*/
 
 struct tcp_conn_handler_data
 {
@@ -138,10 +143,12 @@ repeat_send:
 int tcp_server_receive(struct socket *sock, void *rcv_buf, int size,\
                        unsigned long flags, int huge)
 {
+        int len = 0, totread = 0, left = size;
+        //unsigned long jleft;
         struct msghdr msg;
         struct kvec vec;
-        int len, totread = 0, left = size;
         char *buf = NULL;
+        //DECLARE_WAIT_QUEUE_HEAD(rcvfn_wait);
         
         if(sock==NULL)
                 return -1;
@@ -160,7 +167,27 @@ read_again:
         vec.iov_base = (char *)(buf + totread);
 
         /*
-        if(!skb_queue_empty(&sock->sk->sk_receive_queue))
+        if(huge)
+        {
+                if(skb_queue_empty(&sock->sk->sk_receive_queue))
+                {
+                        jleft = 
+                        wait_event_timeout(rcvfn_wait,\
+                                           (skb_queue_empty(&sock->sk->sk_receive_queue) == 0),\
+                                           10*HZ);
+                
+                        if(skb_queue_empty(&sock->sk->sk_receive_queue))
+                        {
+                                pr_info(" *** mtp | jleft: %lu receive queue is empty even after"
+                                        " 5 sec | tcp_server_receive \n", jleft);
+
+                                goto recv_out;
+                        }
+                }
+        }
+        */
+
+        /*
                 pr_info("recv queue empty ? %s \n",
                         skb_queue_empty(&sock->sk->sk_receive_queue)?"yes":"no");
         */
@@ -190,8 +217,10 @@ read_again:
         }
         //len = msg.msg_iter.kvec->iov_len;
 recv_out:
+
         pr_info(" *** mtp | return from receive after reading total: %d bytes, "
-                "last read: %d bytes | tcp_client_send \n", totread, len);
+                "last read: %d bytes | tcp_server_receive \n", totread, len);
+
         return totread?totread:len;
 }
 
@@ -502,9 +531,11 @@ void drop_connection(struct tcp_conn_handler_data *conn)
               write_unlock(&rs_rwspinlock);
               //up_write(&rs_rwmutex);
               sock_release(rs->lcc_socket);
-              kfree(rs->rs_ip);
+              if(rs->rs_ip != NULL)
+                      kfree(rs->rs_ip);
               //vfree(rs->rs_bitmap);
-              vfree(rs->rs_bflt);
+              if(rs->rs_bflt != NULL)
+                      vfree(rs->rs_bflt);
               kfree(rs);
       }
       kfree(ip);
@@ -817,6 +848,7 @@ pageresp:
                       }
                       else if(memcmp(in_buf, "ADIOS", 5) == 0)
                       {
+                              int r;
                               memset(out_buf, 0, len+1);
                               strcat(out_buf, "ADIOSAMIGO");
                               pr_info(" *** mtp | sending response: %s"
@@ -828,13 +860,20 @@ pageresp:
                                * Not only that, the entire local server 
                                * module should be brought down as there is
                                * no longer a leader server */
+                              r = kthread_stop(fwd_bflt_thread);
+
+                              if(!r)
+                                      pr_info(" *** mtp | timed forward filter thread"
+                                              " stopped | connection_handler *** \n");
+
                               if(cli_conn_socket)
                               {
                                       pr_info(" *** mtp | 1. Closing client "
                                               "connection | connection_handler "
-                                              "**** \n");
+                                              "*** \n");
                                       tcp_client_exit();
                               }
+
                               break;
                       }
               }
@@ -1092,6 +1131,73 @@ err:
         do_exit(0);
 }
 
+int timed_fwd_filter(void* data)
+{
+        struct bloom_filter *bflt = (struct bloom_filter *)data;
+        allow_signal(SIGKILL|SIGSTOP);
+
+        while(1)
+        {
+                __set_current_state(TASK_INTERRUPTIBLE);
+                schedule_timeout(delay*HZ);
+
+                if(kthread_should_stop())
+                {
+                       pr_info(" *** mtp | 1.timed_fwd_filter thread"
+                               " stopped | timed_fwd_filter *** \n");
+
+                       __set_current_state(TASK_RUNNING);
+                       timed_fwd_filter_stopped = 1;
+                       return 0;
+                }
+
+                if(signal_pending(current))
+                {
+                       __set_current_state(TASK_RUNNING);
+                       goto exit_timed_fwd_filter;
+                }
+
+                __set_current_state(TASK_RUNNING);
+
+                if(tcp_client_fwd_filter(bflt) < 0)
+                {
+                        pr_info(" *** mtp | tcp_client_fwd_filter 2 attmepts "
+                                "failed | timed_fwd_filter *** \n");
+                }
+
+                if(kthread_should_stop())
+                {
+                       pr_info(" *** mtp | 2.timed_fwd_filter thread"
+                               " stopped | timed_fwd_filter *** \n");
+
+                       timed_fwd_filter_stopped = 1;
+                       return 0;
+                }
+
+                if(signal_pending(current))
+                {
+                       goto exit_timed_fwd_filter;
+                }
+
+        }
+
+exit_timed_fwd_filter:
+
+        timed_fwd_filter_stopped = 1;
+        do_exit(0);
+}
+
+int start_fwd_filter(struct bloom_filter *bflt)
+{
+        fwd_bflt_thread = 
+        kthread_run((void *)timed_fwd_filter, (void *)bflt, "fwd_bflt");
+
+        if(fwd_bflt_thread == NULL)
+                return -1;
+
+        return 0;
+}
+
 int tcp_server_start(void)
 {
         tcp_server->running = 1;
@@ -1146,6 +1252,7 @@ static int __init network_server_init(void)
         {
                 pr_info(" *** mtp | failed to allocate memory for bflt | "
                         "network_server_init *** \n");
+                return -1;
         }
         else
         {
@@ -1204,20 +1311,26 @@ static int __init network_server_init(void)
                         }
                 }
                 
-
                 kfree(tcp_conn_handler);
                 kfree(tcp_server);
+                vfree(bflt);
                 tcp_server = NULL;
                 return -1;
         }
 
         if(bflt)
         {
+                /*
                 if(tcp_client_fwd_filter(bflt) < 0)
                 {
                         pr_info(" *** mtp | tcp_client_fwd_filter 2 attmepts "
                                 "failed | network_server_init ***\n");
                 }
+                */
+                if(start_fwd_filter(bflt) < 0)
+                        pr_info(" *** mtp | network server unable to start "
+                                "timed_fwd_bflt_thread | network_server_init "
+                                "*** \n");
         }
         else
                 pr_info(" *** mtp | network server unable to call "
@@ -1231,6 +1344,19 @@ static void __exit network_server_exit(void)
 {
         int ret;
         int id;
+
+        if(fwd_bflt_thread != NULL)
+        {
+                if(!timed_fwd_filter_stopped)
+                {
+                        ret = kthread_stop(fwd_bflt_thread);
+
+                        if(!ret)
+                                pr_info(" *** mtp | timed forward filter thread"
+                                        " stopped | network_server_exit *** \n");
+                }
+        }
+
 
         if(tcp_server->thread == NULL)
                 pr_info(" *** mtp | No kernel thread to kill | "

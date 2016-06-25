@@ -159,6 +159,7 @@ read_again:
 int tcp_client_snd_page(struct remote_server *rs, struct page *page)
 {
         int ret = 0, len = 49;
+        unsigned long jleft;
         char in_msg[len+1];
         char out_msg[len+1];
         void *vaddr;
@@ -169,7 +170,7 @@ int tcp_client_snd_page(struct remote_server *rs, struct page *page)
         conn_socket = rs->lcc_socket;
 
         pr_info(" *** mtp | client sending RECV:PAGE to: %s | "
-                "tcp_client_snd_page ***\n", rs->rs_ip);                           
+                "tcp_client_snd_page ***\n", rs->rs_ip);                          
 
         memset(out_msg, 0, len+1);                                        
 
@@ -179,14 +180,16 @@ int tcp_client_snd_page(struct remote_server *rs, struct page *page)
         
 snd_page_wait:
 
+        jleft = 
         wait_event_timeout(page_wait,\
-                           !skb_queue_empty(&conn_socket->sk->sk_receive_queue),\
+                           (skb_queue_empty(&conn_socket->sk->sk_receive_queue) == 0),\
                            10*HZ);   
 
         if(!skb_queue_empty(&conn_socket->sk->sk_receive_queue))              
         {
-                pr_info(" *** mtp | client receiving message | "
-                        "tcp_client_snd_page ***\n");                           
+                pr_info(" *** mtp | wait_event_timeout returned: %lu, secs left"
+                        ": %lu | tcp_client_snd_page ***\n", jleft, jleft/HZ);
+
                 memset(in_msg, 0, len+1);                                 
 
                 ret = tcp_client_receive(conn_socket, in_msg, MSG_DONTWAIT); 
@@ -240,6 +243,10 @@ snd_page_wait:
                                                 "found at: %s | "
                                                 "tcp_client_snd_page *** \n",
                                                 rs->rs_ip);
+
+                                        pr_info("--------------------------"
+                                                "------------------------\n");
+
                                 }
                         }
                         else if(memcmp(in_msg, "FAIL", 4) == 0)
@@ -250,6 +257,9 @@ snd_page_wait:
                                                 "not found at: %s | "
                                                 "tcp_client_snd_page *** \n",
                                                 rs->rs_ip);
+
+                                        pr_info("--------------------------"
+                                                "------------------------\n");
                                 }
                         }
                         else
@@ -274,14 +284,15 @@ page_fail:
 int tcp_client_fwd_filter(struct bloom_filter *bflt)
 {                                                     
         int len = 49;                                              
-        char in_msg[len+1];                                              
-        char out_msg[len+1];                                            
-        int ret;
         int attempts = 0;
-        void *vaddr;
-        //unsigned long off;
+        int ret;
         int size;
         int i;
+        unsigned long jleft;
+        char in_msg[len+1];                                              
+        char out_msg[len+1];                                            
+        void *vaddr;
+        //unsigned long off;
         //struct page *pg;
         //int pc = 0;
 
@@ -315,14 +326,15 @@ bflt_resend:
 fwd_bflt_wait:
         /* this waiting thing can be made a parametrized funtion, the
          * argument to which specifies the wait time*/
-        wait_event_timeout(bflt_wait,\
-                           !skb_queue_empty(&cli_conn_socket->sk->\
-                           sk_receive_queue), 10*HZ);   
+        jleft = wait_event_timeout(bflt_wait,\
+                                   (skb_queue_empty(&cli_conn_socket->sk->\
+                                   sk_receive_queue) == 0), 10*HZ);   
 
         if(!skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue))              
         {                                                                        
-                pr_info(" *** mtp | client receiving message | "
-                        "tcp_client_fwd_filter ***\n");                           
+                pr_info(" *** mtp | wait_event_timeout returned: %lu, secs left"
+                        ": %lu | tcp_client_fwd_filter ***\n", jleft, jleft/HZ);
+
                 memset(in_msg, 0, len+1);                                 
 
                 ret = tcp_client_receive(cli_conn_socket, in_msg, MSG_DONTWAIT); 
@@ -554,22 +566,23 @@ fail:
 
 int tcp_client_connect(void)
 {
+        int len = 49;
+        int ret = -1;
+        unsigned long jleft;
+        char in_msg[len+1];
+        char out_msg[len+1];
+        unsigned char destip[5] = {10,129,41,200,'\0'};
         struct sockaddr_in saddr;
         /*
         struct sockaddr_in daddr;
         struct socket *data_socket = NULL;
         */
         //unsigned char destip[5] = {10,14,15,180,'\0'};
-        unsigned char destip[5] = {10,129,41,200,'\0'};
         //unsigned char destip[5] = {10,14,13,217,'\0'};
         /*
         char *response = kmalloc(4096, GFP_KERNEL);
         char *reply = kmalloc(4096, GFP_KERNEL);
         */
-        int len = 49;
-        char in_msg[len+1];
-        char out_msg[len+1];
-        int ret = -1;
 
         //DECLARE_WAITQUEUE(reg_wait, current);
         DECLARE_WAIT_QUEUE_HEAD(reg_wait);
@@ -612,17 +625,18 @@ int tcp_client_connect(void)
         /* the wait_event_timeout is a better approach as, if the server
          * goes down then you can keep looping here (in this approach)
          */
-        wait_event_timeout(reg_wait,\
-                           !skb_queue_empty(&cli_conn_socket->sk->\
-                           sk_receive_queue), 5*HZ);
+        jleft = wait_event_timeout(reg_wait,\
+                                   (skb_queue_empty(&cli_conn_socket->sk->\
+                                   sk_receive_queue) == 0), 5*HZ);
         /*
         while(1)
         {
         */
                 if(!skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue))
                 {
-                        pr_info(" *** mtp | client receiving message | "
-                                "tcp_client_connect ****\n");
+                        pr_info(" *** mtp | wait_event_timeout returned: %lu, "
+                                " secs left: %lu | tcp_client_connect **** \n",
+                                jleft, jleft/HZ);
 
                         memset(in_msg, 0, len+1);
 
@@ -684,6 +698,7 @@ int tcp_client_init(void)
 void tcp_client_exit(void)
 {
         int len = 49;
+        unsigned long jleft;
         char response[len+1];
         char reply[len+1];
 
@@ -701,12 +716,17 @@ void tcp_client_exit(void)
                 tcp_client_receive(cli_conn_socket, response);
                 add_wait_queue(&cli_conn_socket->sk->sk_wq->wait, &exit_wait)
                 */
-        wait_event_timeout(exit_wait,\
-                           !skb_queue_empty(&cli_conn_socket->sk->\
-                           sk_receive_queue), 5*HZ);
+        jleft = wait_event_timeout(exit_wait,\
+                                   (skb_queue_empty(&cli_conn_socket->sk->\
+                                   sk_receive_queue) == 0), 5*HZ);
+
         if(!skb_queue_empty(&cli_conn_socket->sk->sk_receive_queue))
         {
+                pr_info(" *** mtp | wait_event_timeout returned: %lu, secs left"
+                        ": %lu | network_client_exit *** \n", jleft, jleft/HZ);
+
                 memset(&response, 0, len+1);
+
                 tcp_client_receive(cli_conn_socket, response, MSG_DONTWAIT);
                 //remove_wait_queue(&cli_conn_socket->sk->sk_wq->wait,&exit_wait);
         }
@@ -718,5 +738,6 @@ void tcp_client_exit(void)
                 sock_release(cli_conn_socket);
                 cli_conn_socket = NULL;
         }
+
         pr_info(" *** mtp | network client exiting | network_client_exit *** \n");
 }
